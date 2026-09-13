@@ -1,300 +1,264 @@
-import datetime
-import warnings
-import feedparser
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-import torch
+import pandas as pd
+import numpy as np
 import yfinance as yf
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import feedparser
+
+# ML Imports
 from xgboost import XGBClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.preprocessing import StandardScaler
 
-warnings.filterwarnings("ignore")
+# HuggingFace NLP Import with Fallback
+try:
+    from transformers import pipeline
+    sentiment_pipeline = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+except Exception:
+    sentiment_pipeline = None
 
-# -------------------------------------------------------------------
-# 1. ASSET CATALOG
-# -------------------------------------------------------------------
-ASSET_CATALOG = {
-    "Commodities & Forex": {
-        "Gold Spot (XAU/USD)": "GC=F",
-        "Silver Spot (XAG/USD)": "SI=F",
-        "Crude Oil (WTI)": "CL=F",
-        "EUR/USD": "EURUSD=X",
-        "GBP/USD": "GBPUSD=X",
-        "USD/JPY": "USDJPY=X",
-        "AUD/USD": "AUDUSD=X",
-        "USD/CAD": "USDCAD=X",
-        "GBP/JPY": "GBPJPY=X",
-    },
-    "Crypto": {
-        "Bitcoin": "BTC-USD",
-        "Ethereum": "ETH-USD",
-        "Solana": "SOL-USD",
-        "Binance Coin": "BNB-USD",
-        "Ripple (XRP)": "XRP-USD",
-        "Cardano": "ADA-USD",
-        "Dogecoin": "DOGE-USD",
-        "Avalanche": "AVAX-USD",
-    },
-    "Stocks & Indices": {
-        "S&P 500 Index": "^GSPC",
-        "Nasdaq 100": "^IXIC",
-        "NVIDIA": "NVDA",
-        "Apple": "AAPL",
-        "Tesla": "TSLA",
-        "Microsoft": "MSFT",
-        "Amazon": "AMZN",
-    },
-}
+# ==========================================
+# 1. DATA RETRIEVAL & FEATURE ENGINEERING
+# ==========================================
 
-
-# -------------------------------------------------------------------
-# 2. FINBERT SENTIMENT ANALYSIS
-# -------------------------------------------------------------------
-@st.cache_resource
-def load_sentiment_model():
-    tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "ProsusAI/finbert"
-    )
-    return tokenizer, model
-
-
-def fetch_and_analyze_news(symbol: str) -> float:
-    clean_sym = symbol.split("-")[0].replace("=X", "").replace("=F", "")
-    rss_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={clean_sym}&region=US&lang=en-US"
-    feed = feedparser.parse(rss_url)
-
-    headlines = [entry.title for entry in feed.entries[:5]]
-    if not headlines:
-        return 0.0
-
-    tokenizer, model = load_sentiment_model()
-    inputs = tokenizer(
-        headlines, padding=True, truncation=True, return_tensors="pt"
-    )
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-
-    pos_score = torch.mean(probs[:, 0]).item()
-    neg_score = torch.mean(probs[:, 1]).item()
-    return pos_score - neg_score
-
-
-# -------------------------------------------------------------------
-# 3. TECHNICAL FEATURE ENGINE (SCALPING & DAY TRADING SUPPORT)
-# -------------------------------------------------------------------
-def build_feature_matrix(symbol: str, timeframe: str) -> pd.DataFrame:
-    # Set data period based on selected timeframe
-    if timeframe in ["1m", "5m"]:
-        period = "7d"  # 1m/5m data max intraday period supported by yfinance
-    elif timeframe == "15m":
-        period = "1mo"
-    else:
-        period = "1y"
-
-    df = yf.download(symbol, period=period, interval=timeframe, progress=False)
+@st.cache_data(ttl=300)
+def fetch_market_data(ticker: str, period: str = "60d", interval: str = "15m") -> pd.DataFrame:
+    """Fetch historical OHLCV data using yfinance."""
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
-    # Scalping Indicators
-    df["Return_1"] = df["Close"].pct_change(1)
-    df["Return_3"] = df["Close"].pct_change(3)
-
-    # Fast Moving Averages for Scalping Momentum
-    df["EMA_8"] = df["Close"].ewm(span=8, adjust=False).mean()
-    df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
-    df["EMA_Diff"] = (df["EMA_8"] - df["EMA_21"]) / df["EMA_21"]
-
-    # Volatility (ATR)
-    high_low = df["High"] - df["Low"]
-    high_close = np.abs(df["High"] - df["Close"].shift())
-    low_close = np.abs(df["Low"] - df["Close"].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
-
-    # RSI
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    df["RSI"] = 100 - (100 / (1 + rs))
-
     df.dropna(inplace=True)
     return df
 
-
-# -------------------------------------------------------------------
-# 4. PREDICTIVE SCALPING & DIRECTION MODEL
-# -------------------------------------------------------------------
-def predict_asset_direction(
-    df: pd.DataFrame, news_sentiment: float, is_scalping: bool
-):
+def generate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create stationary technical indicators as ML inputs."""
     data = df.copy()
 
-    # Target timeframe shift: 2 candles forward for scalping, 3 candles for day trading
-    shift_len = -2 if is_scalping else -3
-    volatility = data["Return_1"].std()
-    target_thresh = max(0.001 if is_scalping else 0.005, float(volatility * 0.4))
+    # Stationarity: Relative Price Changes
+    data['returns'] = data['Close'].pct_change()
+    data['log_ret'] = np.log(data['Close'] / data['Close'].shift(1))
+    
+    # Moving Average Deviations (Normalized)
+    data['sma_10'] = data['Close'].rolling(window=10).mean()
+    data['sma_50'] = data['Close'].rolling(window=50).mean()
+    data['dist_sma10'] = (data['Close'] - data['sma_10']) / data['sma_10']
+    data['dist_sma50'] = (data['Close'] - data['sma_50']) / data['sma_50']
+    
+    # Relative Strength Index (RSI)
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-9)
+    data['rsi'] = 100 - (100 / (1 + rs))
 
-    future_returns = data["Close"].shift(shift_len) / data["Close"] - 1
-    data["Target"] = (future_returns > target_thresh).astype(int)
+    # MACD Histogram (Normalized)
+    ema12 = data['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = data['Close'].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    data['macd_hist'] = (macd - signal) / data['Close']
 
-    features = ["Return_1", "Return_3", "EMA_Diff", "RSI", "ATR"]
-    X = data[features].iloc[:shift_len]
-    y = data["Target"].iloc[:shift_len]
+    # Volatility & Volume Change
+    data['volatility'] = data['returns'].rolling(window=14).std()
+    data['volume_change'] = data['Volume'].pct_change()
 
-    if len(X) < 50 or len(np.unique(y)) < 2:
-        return None, 0.50
+    # Target: 1 if future price in N bars is higher, 0 otherwise
+    data['target'] = (data['Close'].shift(-3) > data['Close']).astype(int)
 
-    model = XGBClassifier(
-        n_estimators=120, max_depth=3, learning_rate=0.04, random_state=42
-    )
-    model.fit(X, y)
+    data.dropna(inplace=True)
+    return data
 
-    latest_feats = data[features].iloc[-1:].copy()
-    raw_prob = model.predict_proba(latest_feats)[0][1]
+# ==========================================
+# 2. SENTIMENT ANALYSIS
+# ==========================================
 
-    # Adjust Sentiment Weight for Scalping (Scalping relies 85% on Technicals, 15% News)
-    tech_weight = 0.85 if is_scalping else 0.70
-    sent_weight = 0.15 if is_scalping else 0.30
+@st.cache_data(ttl=900)
+def fetch_sentiment_score(ticker: str) -> float:
+    """Fetch news RSS feed and calculate sentiment score (-1.0 to 1.0)."""
+    rss_url = f"https://news.google.com/rss/search?q={ticker}+stock+when:1d&hl=en-US&gl=US&ceid=US:en"
+    feed = feedparser.parse(rss_url)
+    
+    if not feed.entries:
+        return 0.0  # Neutral default
 
-    norm_sentiment = (news_sentiment + 1.0) / 2.0
-    final_prob = (tech_weight * raw_prob) + (sent_weight * norm_sentiment)
+    headlines = [entry.title for entry in feed.entries[:5]]
+    scores = []
 
-    return model, final_prob
+    if sentiment_pipeline:
+        try:
+            results = sentiment_pipeline(headlines)
+            for res in results:
+                label, score = res['label'], res['score']
+                if label == 'positive':
+                    scores.append(score)
+                elif label == 'negative':
+                    scores.append(-score)
+                else:
+                    scores.append(0.0)
+            return float(np.mean(scores))
+        except Exception:
+            pass
 
+    # Simple Keyword Fallback if FinBERT is unavailable
+    positive_words = {'bull', 'growth', 'surge', 'up', 'high', 'gain', 'profit', 'buy'}
+    negative_words = {'bear', 'drop', 'fall', 'down', 'low', 'loss', 'sell', 'risk'}
 
-# -------------------------------------------------------------------
-# 5. STREAMLIT FRONTEND
-# -------------------------------------------------------------------
-st.set_page_config(page_title="AI Scalping & Direction Engine", layout="wide")
-
-st.title("⚡ AI Scalping & Direction Predictor")
-
-# Sidebar Configuration
-category = st.sidebar.selectbox(
-    "Select Sector:", list(ASSET_CATALOG.keys())
-)
-selected_name = st.sidebar.selectbox(
-    "Select Asset:", list(ASSET_CATALOG[category].keys())
-)
-symbol = ASSET_CATALOG[category][selected_name]
-
-st.sidebar.divider()
-st.sidebar.subheader("⚙️ Trading Strategy Mode")
-trading_mode = st.sidebar.radio(
-    "Select Strategy:", ["Scalping Mode (Fast)", "Day Trading Mode"]
-)
-
-if trading_mode == "Scalping Mode (Fast)":
-    is_scalping = True
-    timeframe = st.sidebar.selectbox("Scalp Timeframe:", ["1m", "5m", "15m"])
-else:
-    is_scalping = False
-    timeframe = st.sidebar.selectbox("Trading Timeframe:", ["1h", "1d"])
-
-if st.button(f"🚀 Execute AI Scan for {selected_name}"):
-    with st.spinner(f"Fetching {timeframe} market data & training model..."):
-        df = build_feature_matrix(symbol, timeframe)
-        sentiment = fetch_and_analyze_news(symbol)
-        model, confidence = predict_asset_direction(
-            df, sentiment, is_scalping
-        )
-
-        current_price = float(df["Close"].iloc[-1])
-        atr = float(df["ATR"].iloc[-1])
-
-        # Scalping Risk Management Targets
-        target_multiplier = 1.2 if is_scalping else 2.0
-        stop_multiplier = 0.8 if is_scalping else 1.0
-
-        if confidence >= 0.52:
-            action = "BUY 🟢"
-            direction = "BULLISH SCALP / TREND"
-            target_price = current_price + (target_multiplier * atr)
-            stop_loss = current_price - (stop_multiplier * atr)
-        elif confidence <= 0.48:
-            action = "SELL / SHORT 🔴"
-            direction = "BEARISH SCALP / TREND"
-            target_price = current_price - (target_multiplier * atr)
-            stop_loss = current_price + (stop_multiplier * atr)
+    for headline in headlines:
+        words = set(headline.lower().split())
+        pos_count = len(words.intersection(positive_words))
+        neg_count = len(words.intersection(negative_words))
+        if pos_count + neg_count > 0:
+            scores.append((pos_count - neg_count) / (pos_count + neg_count))
         else:
-            action = "NEUTRAL 🟡"
-            direction = "NO CLEAR SCALP SIGNAL"
-            target_price = current_price
-            stop_loss = current_price
+            scores.append(0.0)
 
-        # Display Key Information
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Recommended Action", action)
-        col2.metric("Signal Confidence", f"{round(confidence * 100, 1)}%")
-        col3.metric("Timeframe", timeframe)
-        col4.metric(
-            "Current Price",
-            (
-                f"${round(current_price, 4)}"
-                if "USD" in symbol or "=F" in symbol
-                else f"{round(current_price, 2)}"
-            ),
-        )
+    return float(np.mean(scores)) if scores else 0.0
 
-        st.divider()
+# ==========================================
+# 3. CALIBRATED ML MODEL PREDICTION
+# ==========================================
 
-        st.subheader("🎯 Scalp / Trade Execution Specifications")
-        exec_df = pd.DataFrame(
-            [
-                {
-                    "Asset": selected_name,
-                    "Strategy": trading_mode,
-                    "Action": action,
-                    "Entry Price": round(current_price, 4),
-                    "Take Profit Target": round(target_price, 4),
-                    "Stop Loss Target": round(stop_loss, 4),
-                    "Est. Scalp Duration": (
-                        "2 - 5 Candles"
-                        if is_scalping
-                        else "1 - 3 Days"
-                    ),
-                }
-            ]
-        )
-        st.dataframe(exec_df, use_container_width=True)
+def predict_asset_direction(
+    df: pd.DataFrame, 
+    sentiment_score: float, 
+    min_confidence: float = 0.65
+) -> tuple[str, float, dict]:
+    """Train calibrated XGBoost model and generate actionable market signals."""
+    feature_cols = [
+        'returns', 'log_ret', 'dist_sma10', 'dist_sma50', 
+        'rsi', 'macd_hist', 'volatility', 'volume_change'
+    ]
+    
+    X = df[feature_cols].copy()
+    X['sentiment'] = sentiment_score
+    y = df['target']
 
-        # Plot Scalping Chart (EMA 8 & EMA 21)
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=df.index[-60:],
-                open=df["Open"][-60:],
-                high=df["High"][-60:],
-                low=df["Low"][-60:],
-                close=df["Close"][-60:],
-                name="Price",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df.index[-60:],
-                y=df["EMA_8"][-60:],
-                name="EMA 8 (Fast)",
-                line=dict(color="lightgreen", width=1.5),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df.index[-60:],
-                y=df["EMA_21"][-60:],
-                name="EMA 21 (Slow)",
-                line=dict(color="red", width=1.5),
-            )
-        )
-        fig.update_layout(
-            title=f"{selected_name} ({timeframe}) Chart",
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # Train / Test split (Time-series chronological split)
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    # Scale Features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Base Estimator: Un-degraded shallow XGBoost to prevent overfitting
+    base_model = XGBClassifier(
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        eval_metric="logloss"
+    )
+
+    # Calibrate Probabilities via Sigmoid/Platt Scaling
+    calibrated_model = CalibratedClassifierCV(
+        estimator=base_model,
+        method='sigmoid',
+        cv=3
+    )
+    calibrated_model.fit(X_train_scaled, y_train)
+
+    # Predict latest bar with calibrated probabilities
+    latest_features = X_test_scaled[-1:]
+    probs = calibrated_model.predict_proba(latest_features)[0]  # [Prob(SELL), Prob(BUY)]
+    
+    raw_confidence = float(np.max(probs))
+    predicted_class = int(np.argmax(probs))
+
+    # Strict Confidence Threshold Filter
+    if raw_confidence < min_confidence:
+        signal = "HOLD / NEUTRAL"
+    else:
+        signal = "BUY" if predicted_class == 1 else "SELL"
+
+    metrics = {
+        "Prob(BUY)": round(float(probs[1]) * 100, 2),
+        "Prob(SELL)": round(float(probs[0]) * 100, 2),
+        "Sentiment Score": round(sentiment_score, 3)
+    }
+
+    return signal, raw_confidence, metrics
+
+# ==========================================
+# 4. STREAMLIT FRONTEND DASHBOARD
+# ==========================================
+
+def main():
+    st.set_page_config(page_title="Trade Ideas Pro", layout="wide")
+    st.title("📈 Trade Ideas Pro (Scalp & Trend Analytics)")
+
+    # Sidebar Controls
+    st.sidebar.header("Strategy Settings")
+    ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL").upper()
+    timeframe = st.sidebar.selectbox("Select Interval", options=["5m", "15m", "1h", "1d"], index=1)
+    period_map = {"5m": "7d", "15m": "60d", "1h": "60d", "1d": "2y"}
+    
+    st.sidebar.markdown("---")
+    min_conf = st.sidebar.slider(
+        "Min Confidence Filter", 
+        min_value=0.55, 
+        max_value=0.85, 
+        value=0.65, 
+        step=0.05,
+        help="Signals below this probability threshold default to HOLD / NEUTRAL."
+    )
+
+    if st.sidebar.button("Run Model Prediction", type="primary"):
+        with st.spinner("Fetching market data and running calibrated model..."):
+            try:
+                # 1. Fetch & Engineer Data
+                raw_df = fetch_market_data(ticker, period=period_map[timeframe], interval=timeframe)
+                if raw_df.empty:
+                    st.error(f"No data returned for ticker '{ticker}'. Verify the symbol.")
+                    return
+
+                processed_df = generate_features(raw_df)
+                
+                # 2. Fetch Sentiment
+                sentiment = fetch_sentiment_score(ticker)
+                
+                # 3. Model Inference
+                signal, confidence, metrics = predict_asset_direction(
+                    processed_df, 
+                    sentiment_score=sentiment, 
+                    min_confidence=min_conf
+                )
+
+                # Output Metrics Header
+                col1, col2, col3, col4 = st.columns(4)
+                
+                # Dynamic Metric Colors
+                if signal == "BUY":
+                    col1.metric("Model Signal", signal, delta="Bullish Edge", delta_color="normal")
+                elif signal == "SELL":
+                    col1.metric("Model Signal", signal, delta="-Bearish Edge", delta_color="inverse")
+                else:
+                    col1.metric("Model Signal", signal, delta="Low Conviction", delta_color="off")
+
+                col2.metric("Calibrated Confidence", f"{confidence * 100:.1f}%")
+                col3.metric("Buy Probability", f"{metrics['Prob(BUY)']}%")
+                col4.metric("Sentiment Index", f"{metrics['Sentiment Score']}")
+
+                # Plot Candlestick Chart
+                st.subheader(f"Price Action ({ticker})")
+                fig = go.Figure(data=[go.Candlestick(
+                    x=raw_df.index,
+                    open=raw_df['Open'],
+                    high=raw_df['High'],
+                    low=raw_df['Low'],
+                    close=raw_df['Close'],
+                    name=ticker
+                )])
+                fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Execution Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
