@@ -5,23 +5,11 @@ import yfinance as yf
 import plotly.graph_objects as go
 import feedparser
 import gc
-import nltk
-
-# Download VADER lexicon silently for lightweight sentiment
-try:
-    nltk.data.find('sentiment/vader_lexicon.zip')
-except LookupError:
-    nltk.download('vader_lexicon', quiet=True)
-
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ML Imports
 from xgboost import XGBClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
-
-# Initialize Lightweight Sentiment Analyzer
-vader_analyzer = SentimentIntensityAnalyzer()
 
 # ==========================================
 # 1. PRESET TICKER DICTIONARIES
@@ -115,12 +103,12 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 # ==========================================
-# 3. LIGHTWEIGHT SENTIMENT ANALYSIS
+# 3. LIGHTWEIGHT KEYWORD SENTIMENT ANALYSIS
 # ==========================================
 
 @st.cache_data(ttl=900, max_entries=20)
 def fetch_sentiment_score(ticker: str) -> float:
-    """Fetch news RSS feed and calculate sentiment using lightweight VADER."""
+    """Fetch news RSS feed and calculate sentiment score using built-in lists."""
     clean_search = ticker.split('-')[0].split('=')[0].replace('^', '')
     rss_url = f"https://news.google.com/rss/search?q={clean_search}+market+when:1d&hl=en-US&gl=US&ceid=US:en"
     
@@ -129,10 +117,19 @@ def fetch_sentiment_score(ticker: str) -> float:
         if not feed.entries:
             return 0.0
 
+        positive_words = {'bull', 'growth', 'surge', 'up', 'high', 'gain', 'profit', 'buy', 'rally', 'beat', 'positive', 'strong'}
+        negative_words = {'bear', 'drop', 'fall', 'down', 'low', 'loss', 'sell', 'risk', 'crash', 'slump', 'negative', 'weak', 'miss'}
+
         scores = []
         for entry in feed.entries[:5]:
-            vs = vader_analyzer.polarity_scores(entry.title)
-            scores.append(vs['compound'])
+            words = set(entry.title.lower().split())
+            pos_count = len(words.intersection(positive_words))
+            neg_count = len(words.intersection(negative_words))
+            total = pos_count + neg_count
+            if total > 0:
+                scores.append((pos_count - neg_count) / total)
+            else:
+                scores.append(0.0)
 
         return float(np.mean(scores)) if scores else 0.0
     except Exception:
@@ -153,7 +150,7 @@ def get_calibrated_model(X_train_scaled: np.ndarray, y_train: pd.Series):
         colsample_bytree=0.8,
         random_state=42,
         eval_metric="logloss",
-        n_jobs=1  # Prevent multi-threading CPU contention across sessions
+        n_jobs=1
     )
 
     calibrated_model = CalibratedClassifierCV(
@@ -210,7 +207,6 @@ def predict_asset_direction(
         "Sentiment Score": round(sentiment_score, 3)
     }
 
-    # Free memory explicitly
     del X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled
     gc.collect()
 
