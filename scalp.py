@@ -93,6 +93,13 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     data['volatility'] = data['returns'].rolling(window=14).std()
     data['volume_change'] = data['Volume'].pct_change()
 
+    # Average True Range (ATR for SL/TP generation)
+    high_low = data['High'] - data['Low']
+    high_close = np.abs(data['High'] - data['Close'].shift())
+    low_close = np.abs(data['Low'] - data['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    data['atr'] = tr.rolling(14).mean()
+
     # Target: 1 if future price in 3 bars is higher, 0 otherwise
     data['target'] = (data['Close'].shift(-3) > data['Close']).astype(int)
 
@@ -240,7 +247,7 @@ def main():
         "Min Confidence Threshold", 
         min_value=0.40, 
         max_value=0.85, 
-        value=0.65, 
+        value=0.50, 
         step=0.01,
         help="Signals below this score default to HOLD. Recommended: 0.65 to 0.70 to avoid bad trades."
     )
@@ -262,6 +269,7 @@ def main():
                     min_confidence=min_conf
                 )
 
+                # Primary Signal Cards
                 col1, col2, col3, col4 = st.columns(4)
                 
                 if signal == "BUY":
@@ -275,6 +283,40 @@ def main():
                 col3.metric("Buy Probability", f"{metrics['Prob(BUY)']}%")
                 col4.metric("Sentiment Score", f"{metrics['Sentiment Score']}")
 
+                # ----------------------------------------------------
+                # ENTRY, STOP LOSS & TAKE PROFIT METRICS
+                # ----------------------------------------------------
+                current_price = float(processed_df['Close'].iloc[-1])
+                current_atr = float(processed_df['atr'].iloc[-1])
+
+                st.markdown("### 🎯 Trade Execution Levels")
+                e_col1, e_col2, e_col3, e_col4 = st.columns(4)
+
+                if signal == "BUY":
+                    stop_loss = current_price - (1.5 * current_atr)
+                    take_profit = current_price + (3.0 * current_atr)
+                    
+                    e_col1.metric("Entry Price", f"${current_price:,.4f}" if current_price < 1 else f"${current_price:,.2f}")
+                    e_col2.metric("Stop Loss (SL)", f"${stop_loss:,.4f}" if current_price < 1 else f"${stop_loss:,.2f}", delta="-1.5x ATR", delta_color="inverse")
+                    e_col3.metric("Take Profit (TP)", f"${take_profit:,.4f}" if current_price < 1 else f"${take_profit:,.2f}", delta="+3.0x ATR", delta_color="normal")
+                    e_col4.metric("Risk : Reward", "1 : 2.0")
+
+                elif signal == "SELL":
+                    stop_loss = current_price + (1.5 * current_atr)
+                    take_profit = current_price - (3.0 * current_atr)
+
+                    e_col1.metric("Entry Price", f"${current_price:,.4f}" if current_price < 1 else f"${current_price:,.2f}")
+                    e_col2.metric("Stop Loss (SL)", f"${stop_loss:,.4f}" if current_price < 1 else f"${stop_loss:,.2f}", delta="+1.5x ATR", delta_color="inverse")
+                    e_col3.metric("Take Profit (TP)", f"${take_profit:,.4f}" if current_price < 1 else f"${take_profit:,.2f}", delta="-3.0x ATR", delta_color="normal")
+                    e_col4.metric("Risk : Reward", "1 : 2.0")
+
+                else:
+                    e_col1.metric("Entry Price", f"${current_price:,.4f}" if current_price < 1 else f"${current_price:,.2f}")
+                    e_col2.metric("Stop Loss (SL)", "N/A")
+                    e_col3.metric("Take Profit (TP)", "N/A")
+                    e_col4.metric("Risk : Reward", "N/A")
+
+                # Warning / Success Banner
                 if signal == "HOLD / NEUTRAL":
                     st.warning(
                         f"⚠️ **Trade Skipped:** The model's win probability is **{confidence * 100:.1f}%**, "
@@ -284,6 +326,7 @@ def main():
                 else:
                     st.success(f"✅ **Trade Setup Identified:** High probability signal with {confidence * 100:.1f}% confidence.")
 
+                # Price Action Candlestick Chart
                 st.subheader(f"Price Action ({ticker})")
                 fig = go.Figure(data=[go.Candlestick(
                     x=raw_df.index,
