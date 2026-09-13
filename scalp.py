@@ -4,6 +4,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 import feedparser
+import gc
 
 # ML Imports
 from xgboost import XGBClassifier
@@ -59,7 +60,7 @@ ASSET_PRESETS = {
 # ==========================================
 
 @st.cache_data(ttl=300)
-def fetch_market_data(ticker: str, period: str = "60d", interval: str = "15m") -> pd.DataFrame:
+def fetch_market_data(ticker: str, period: str = "30d", interval: str = "15m") -> pd.DataFrame:
     """Fetch historical OHLCV data using yfinance."""
     df = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
@@ -112,7 +113,6 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=900)
 def fetch_sentiment_score(ticker: str) -> float:
     """Fetch news RSS feed and calculate sentiment score (-1.0 to 1.0)."""
-    # Clean ticker string for news search (e.g., BTC-USD -> BTC)
     clean_search = ticker.split('-')[0].split('=')[0].replace('^', '')
     rss_url = f"https://news.google.com/rss/search?q={clean_search}+market+when:1d&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
@@ -154,8 +154,29 @@ def fetch_sentiment_score(ticker: str) -> float:
     return float(np.mean(scores)) if scores else 0.0
 
 # ==========================================
-# 4. CALIBRATED ML MODEL PREDICTION
+# 4. CACHED MODEL TRAINING & PREDICTION
 # ==========================================
+
+@st.cache_resource(ttl=900)
+def train_calibrated_model(X_train_scaled: np.ndarray, y_train: pd.Series):
+    """Cache calibrated XGBoost model training to prevent RAM leak crashes."""
+    base_model = XGBClassifier(
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        eval_metric="logloss"
+    )
+
+    calibrated_model = CalibratedClassifierCV(
+        estimator=base_model,
+        method='sigmoid',
+        cv=3
+    )
+    calibrated_model.fit(X_train_scaled, y_train)
+    return calibrated_model
 
 def predict_asset_direction(
     df: pd.DataFrame, 
@@ -180,22 +201,8 @@ def predict_asset_direction(
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    base_model = XGBClassifier(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.03,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        eval_metric="logloss"
-    )
-
-    calibrated_model = CalibratedClassifierCV(
-        estimator=base_model,
-        method='sigmoid',
-        cv=3
-    )
-    calibrated_model.fit(X_train_scaled, y_train)
+    # Fetch/Train cached model
+    calibrated_model = train_calibrated_model(X_train_scaled, y_train)
 
     latest_features = X_test_scaled[-1:]
     probs = calibrated_model.predict_proba(latest_features)[0]
@@ -214,6 +221,10 @@ def predict_asset_direction(
         "Prob(SELL)": round(float(probs[0]) * 100, 2),
         "Sentiment Score": round(sentiment_score, 3)
     }
+
+    # Garbage collection to free server RAM
+    del X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled
+    gc.collect()
 
     return signal, raw_confidence, metrics
 
@@ -238,7 +249,7 @@ def main():
 
     st.sidebar.header("2. Strategy Settings")
     timeframe = st.sidebar.selectbox("Timeframe / Interval", options=["5m", "15m", "1h", "1d"], index=1)
-    period_map = {"5m": "7d", "15m": "60d", "1h": "60d", "1d": "2y"}
+    period_map = {"5m": "5d", "15m": "30d", "1h": "30d", "1d": "1y"}
     
     st.sidebar.markdown("---")
     min_conf = st.sidebar.slider(
