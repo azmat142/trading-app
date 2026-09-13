@@ -225,7 +225,7 @@ def predict_asset_direction(
 
 def main():
     st.set_page_config(page_title="Trade Ideas Pro", layout="wide")
-    st.title("📈 Trade Ideas Pro (Scalp & Trend Analytics)")
+    st.title("📈 Trade Ideas Pro (MA Globals)")
 
     # Sidebar Controls
     st.sidebar.header("1. Select Market Asset")
