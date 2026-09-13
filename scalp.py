@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
 import feedparser
 
 # ML Imports
@@ -19,7 +18,44 @@ except Exception:
     sentiment_pipeline = None
 
 # ==========================================
-# 1. DATA RETRIEVAL & FEATURE ENGINEERING
+# 1. PRESET TICKER DICTIONARIES
+# ==========================================
+
+ASSET_PRESETS = {
+    "Forex": {
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X",
+        "USD/JPY": "JPY=X",
+        "AUD/USD": "AUDUSD=X",
+        "USD/CAD": "CAD=X",
+        "Gold (XAU/USD)": "GC=F",
+        "Silver (XAG/USD)": "SI=F"
+    },
+    "Crypto": {
+        "Bitcoin (BTC/USD)": "BTC-USD",
+        "Ethereum (ETH/USD)": "ETH-USD",
+        "Solana (SOL/USD)": "SOL-USD",
+        "Ripple (XRP/USD)": "XRP-USD",
+        "Cardano (ADA/USD)": "ADA-USD",
+        "Dogecoin (DOGE/USD)": "DOGE-USD"
+    },
+    "Stocks": {
+        "Apple (AAPL)": "AAPL",
+        "NVIDIA (NVDA)": "NVDA",
+        "Tesla (TSLA)": "TSLA",
+        "Microsoft (MSFT)": "MSFT",
+        "Amazon (AMZN)": "AMZN",
+        "Meta (META)": "META"
+    },
+    "Indices": {
+        "S&P 500": "^GSPC",
+        "Nasdaq 100": "^IXIC",
+        "Dow Jones": "^DJI"
+    }
+}
+
+# ==========================================
+# 2. DATA RETRIEVAL & FEATURE ENGINEERING
 # ==========================================
 
 @st.cache_data(ttl=300)
@@ -63,24 +99,26 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     data['volatility'] = data['returns'].rolling(window=14).std()
     data['volume_change'] = data['Volume'].pct_change()
 
-    # Target: 1 if future price in N bars is higher, 0 otherwise
+    # Target: 1 if future price in 3 bars is higher, 0 otherwise
     data['target'] = (data['Close'].shift(-3) > data['Close']).astype(int)
 
     data.dropna(inplace=True)
     return data
 
 # ==========================================
-# 2. SENTIMENT ANALYSIS
+# 3. SENTIMENT ANALYSIS
 # ==========================================
 
 @st.cache_data(ttl=900)
 def fetch_sentiment_score(ticker: str) -> float:
     """Fetch news RSS feed and calculate sentiment score (-1.0 to 1.0)."""
-    rss_url = f"https://news.google.com/rss/search?q={ticker}+stock+when:1d&hl=en-US&gl=US&ceid=US:en"
+    # Clean ticker string for news search (e.g., BTC-USD -> BTC)
+    clean_search = ticker.split('-')[0].split('=')[0].replace('^', '')
+    rss_url = f"https://news.google.com/rss/search?q={clean_search}+market+when:1d&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
     
     if not feed.entries:
-        return 0.0  # Neutral default
+        return 0.0
 
     headlines = [entry.title for entry in feed.entries[:5]]
     scores = []
@@ -100,7 +138,7 @@ def fetch_sentiment_score(ticker: str) -> float:
         except Exception:
             pass
 
-    # Simple Keyword Fallback if FinBERT is unavailable
+    # Keyword Fallback
     positive_words = {'bull', 'growth', 'surge', 'up', 'high', 'gain', 'profit', 'buy'}
     negative_words = {'bear', 'drop', 'fall', 'down', 'low', 'loss', 'sell', 'risk'}
 
@@ -116,7 +154,7 @@ def fetch_sentiment_score(ticker: str) -> float:
     return float(np.mean(scores)) if scores else 0.0
 
 # ==========================================
-# 3. CALIBRATED ML MODEL PREDICTION
+# 4. CALIBRATED ML MODEL PREDICTION
 # ==========================================
 
 def predict_asset_direction(
@@ -134,17 +172,14 @@ def predict_asset_direction(
     X['sentiment'] = sentiment_score
     y = df['target']
 
-    # Train / Test split (Time-series chronological split)
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-    # Scale Features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Base Estimator: Un-degraded shallow XGBoost to prevent overfitting
     base_model = XGBClassifier(
         n_estimators=100,
         max_depth=3,
@@ -155,7 +190,6 @@ def predict_asset_direction(
         eval_metric="logloss"
     )
 
-    # Calibrate Probabilities via Sigmoid/Platt Scaling
     calibrated_model = CalibratedClassifierCV(
         estimator=base_model,
         method='sigmoid',
@@ -163,9 +197,8 @@ def predict_asset_direction(
     )
     calibrated_model.fit(X_train_scaled, y_train)
 
-    # Predict latest bar with calibrated probabilities
     latest_features = X_test_scaled[-1:]
-    probs = calibrated_model.predict_proba(latest_features)[0]  # [Prob(SELL), Prob(BUY)]
+    probs = calibrated_model.predict_proba(latest_features)[0]
     
     raw_confidence = float(np.max(probs))
     predicted_class = int(np.argmax(probs))
@@ -185,36 +218,45 @@ def predict_asset_direction(
     return signal, raw_confidence, metrics
 
 # ==========================================
-# 4. STREAMLIT FRONTEND DASHBOARD
+# 5. STREAMLIT FRONTEND DASHBOARD
 # ==========================================
 
 def main():
     st.set_page_config(page_title="Trade Ideas Pro", layout="wide")
     st.title("📈 Trade Ideas Pro (Scalp & Trend Analytics)")
 
-    # Sidebar Controls
-    st.sidebar.header("Strategy Settings")
-    ticker = st.sidebar.text_input("Ticker Symbol", value="AAPL").upper()
-    timeframe = st.sidebar.selectbox("Select Interval", options=["5m", "15m", "1h", "1d"], index=1)
+    # Sidebar Controls: Asset & Ticker Selector
+    st.sidebar.header("1. Select Market Asset")
+    asset_class = st.sidebar.selectbox("Asset Class", options=["Forex", "Crypto", "Stocks", "Indices", "Custom Input"])
+
+    if asset_class == "Custom Input":
+        ticker = st.sidebar.text_input("Enter Ticker Symbol", value="AAPL").upper()
+    else:
+        preset_options = ASSET_PRESETS[asset_class]
+        selected_name = st.sidebar.selectbox("Select Asset / Pair", options=list(preset_options.keys()))
+        ticker = preset_options[selected_name]
+
+    st.sidebar.header("2. Strategy Settings")
+    timeframe = st.sidebar.selectbox("Timeframe / Interval", options=["5m", "15m", "1h", "1d"], index=1)
     period_map = {"5m": "7d", "15m": "60d", "1h": "60d", "1d": "2y"}
     
     st.sidebar.markdown("---")
     min_conf = st.sidebar.slider(
-        "Min Confidence Filter", 
+        "Min Confidence Threshold", 
         min_value=0.55, 
         max_value=0.85, 
         value=0.65, 
-        step=0.05,
-        help="Signals below this probability threshold default to HOLD / NEUTRAL."
+        step=0.01,
+        help="Signals below this score default to HOLD. Recommended: 0.65 to 0.70 to avoid bad trades."
     )
 
     if st.sidebar.button("Run Model Prediction", type="primary"):
-        with st.spinner("Fetching market data and running calibrated model..."):
+        with st.spinner(f"Analyzing {ticker} across indicators and news..."):
             try:
-                # 1. Fetch & Engineer Data
+                # 1. Fetch & Process Data
                 raw_df = fetch_market_data(ticker, period=period_map[timeframe], interval=timeframe)
                 if raw_df.empty:
-                    st.error(f"No data returned for ticker '{ticker}'. Verify the symbol.")
+                    st.error(f"No market data returned for ticker '{ticker}'.")
                     return
 
                 processed_df = generate_features(raw_df)
@@ -229,20 +271,29 @@ def main():
                     min_confidence=min_conf
                 )
 
-                # Output Metrics Header
+                # Metric Header Displays
                 col1, col2, col3, col4 = st.columns(4)
                 
-                # Dynamic Metric Colors
                 if signal == "BUY":
-                    col1.metric("Model Signal", signal, delta="Bullish Edge", delta_color="normal")
+                    col1.metric("Model Signal", signal, delta="BUY ENTRY", delta_color="normal")
                 elif signal == "SELL":
-                    col1.metric("Model Signal", signal, delta="-Bearish Edge", delta_color="inverse")
+                    col1.metric("Model Signal", signal, delta="SELL ENTRY", delta_color="inverse")
                 else:
-                    col1.metric("Model Signal", signal, delta="Low Conviction", delta_color="off")
+                    col1.metric("Model Signal", signal, delta="Low Confidence (HOLD)", delta_color="off")
 
-                col2.metric("Calibrated Confidence", f"{confidence * 100:.1f}%")
+                col2.metric("Calibrated Probability", f"{confidence * 100:.1f}%")
                 col3.metric("Buy Probability", f"{metrics['Prob(BUY)']}%")
-                col4.metric("Sentiment Index", f"{metrics['Sentiment Score']}")
+                col4.metric("Sentiment Score", f"{metrics['Sentiment Score']}")
+
+                # Status Warning Box
+                if signal == "HOLD / NEUTRAL":
+                    st.warning(
+                        f"⚠️ **Trade Skipped:** The model's win probability is **{confidence * 100:.1f}%**, "
+                        f"which is below your required **{min_conf * 100:.0f}%** threshold. "
+                        "Stay out of the market during low-conviction conditions."
+                    )
+                else:
+                    st.success(f"✅ **Trade Setup Identified:** High probability signal with {confidence * 100:.1f}% confidence.")
 
                 # Plot Candlestick Chart
                 st.subheader(f"Price Action ({ticker})")
