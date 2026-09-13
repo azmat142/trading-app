@@ -238,7 +238,7 @@ def main():
     st.sidebar.markdown("---")
     min_conf = st.sidebar.slider(
         "Min Confidence Threshold", 
-        min_value=0.55, 
+        min_value=0.40, 
         max_value=0.85, 
         value=0.65, 
         step=0.01,
