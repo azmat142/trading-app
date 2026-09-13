@@ -5,18 +5,23 @@ import yfinance as yf
 import plotly.graph_objects as go
 import feedparser
 import gc
+import nltk
+
+# Download VADER lexicon silently for lightweight sentiment
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon', quiet=True)
+
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ML Imports
 from xgboost import XGBClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 
-# HuggingFace NLP Import with Fallback
-try:
-    from transformers import pipeline
-    sentiment_pipeline = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-except Exception:
-    sentiment_pipeline = None
+# Initialize Lightweight Sentiment Analyzer
+vader_analyzer = SentimentIntensityAnalyzer()
 
 # ==========================================
 # 1. PRESET TICKER DICTIONARIES
@@ -59,9 +64,9 @@ ASSET_PRESETS = {
 # 2. DATA RETRIEVAL & FEATURE ENGINEERING
 # ==========================================
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, max_entries=10)
 def fetch_market_data(ticker: str, period: str = "30d", interval: str = "15m") -> pd.DataFrame:
-    """Fetch historical OHLCV data using yfinance."""
+    """Fetch historical OHLCV data using yfinance with strict caching."""
     df = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -72,15 +77,15 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     """Create stationary technical indicators as ML inputs."""
     data = df.copy()
 
-    # Stationarity: Relative Price Changes
+    # Relative Price Changes
     data['returns'] = data['Close'].pct_change()
     data['log_ret'] = np.log(data['Close'] / data['Close'].shift(1))
     
-    # Moving Average Deviations (Normalized)
+    # Moving Average Deviations
     data['sma_10'] = data['Close'].rolling(window=10).mean()
     data['sma_50'] = data['Close'].rolling(window=50).mean()
-    data['dist_sma10'] = (data['Close'] - data['sma_10']) / data['sma_10']
-    data['dist_sma50'] = (data['Close'] - data['sma_50']) / data['sma_50']
+    data['dist_sma10'] = (data['Close'] - data['sma_10']) / (data['sma_10'] + 1e-9)
+    data['dist_sma50'] = (data['Close'] - data['sma_50']) / (data['sma_50'] + 1e-9)
     
     # Relative Strength Index (RSI)
     delta = data['Close'].diff()
@@ -89,12 +94,12 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     rs = gain / (loss + 1e-9)
     data['rsi'] = 100 - (100 / (1 + rs))
 
-    # MACD Histogram (Normalized)
+    # MACD Histogram
     ema12 = data['Close'].ewm(span=12, adjust=False).mean()
     ema26 = data['Close'].ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
-    data['macd_hist'] = (macd - signal) / data['Close']
+    data['macd_hist'] = (macd - signal) / (data['Close'] + 1e-9)
 
     # Volatility & Volume Change
     data['volatility'] = data['returns'].rolling(window=14).std()
@@ -103,71 +108,52 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     # Target: 1 if future price in 3 bars is higher, 0 otherwise
     data['target'] = (data['Close'].shift(-3) > data['Close']).astype(int)
 
+    # Clean missing values and infinity flags
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
     data.dropna(inplace=True)
+
     return data
 
 # ==========================================
-# 3. SENTIMENT ANALYSIS
+# 3. LIGHTWEIGHT SENTIMENT ANALYSIS
 # ==========================================
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900, max_entries=20)
 def fetch_sentiment_score(ticker: str) -> float:
-    """Fetch news RSS feed and calculate sentiment score (-1.0 to 1.0)."""
+    """Fetch news RSS feed and calculate sentiment using lightweight VADER."""
     clean_search = ticker.split('-')[0].split('=')[0].replace('^', '')
     rss_url = f"https://news.google.com/rss/search?q={clean_search}+market+when:1d&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(rss_url)
     
-    if not feed.entries:
+    try:
+        feed = feedparser.parse(rss_url)
+        if not feed.entries:
+            return 0.0
+
+        scores = []
+        for entry in feed.entries[:5]:
+            vs = vader_analyzer.polarity_scores(entry.title)
+            scores.append(vs['compound'])
+
+        return float(np.mean(scores)) if scores else 0.0
+    except Exception:
         return 0.0
-
-    headlines = [entry.title for entry in feed.entries[:5]]
-    scores = []
-
-    if sentiment_pipeline:
-        try:
-            results = sentiment_pipeline(headlines)
-            for res in results:
-                label, score = res['label'], res['score']
-                if label == 'positive':
-                    scores.append(score)
-                elif label == 'negative':
-                    scores.append(-score)
-                else:
-                    scores.append(0.0)
-            return float(np.mean(scores))
-        except Exception:
-            pass
-
-    # Keyword Fallback
-    positive_words = {'bull', 'growth', 'surge', 'up', 'high', 'gain', 'profit', 'buy'}
-    negative_words = {'bear', 'drop', 'fall', 'down', 'low', 'loss', 'sell', 'risk'}
-
-    for headline in headlines:
-        words = set(headline.lower().split())
-        pos_count = len(words.intersection(positive_words))
-        neg_count = len(words.intersection(negative_words))
-        if pos_count + neg_count > 0:
-            scores.append((pos_count - neg_count) / (pos_count + neg_count))
-        else:
-            scores.append(0.0)
-
-    return float(np.mean(scores)) if scores else 0.0
 
 # ==========================================
 # 4. CACHED MODEL TRAINING & PREDICTION
 # ==========================================
 
-@st.cache_resource(ttl=900)
-def train_calibrated_model(X_train_scaled: np.ndarray, y_train: pd.Series):
-    """Cache calibrated XGBoost model training to prevent RAM leak crashes."""
+@st.cache_resource(ttl=900, max_entries=5)
+def get_calibrated_model(X_train_scaled: np.ndarray, y_train: pd.Series):
+    """Global multi-thread safe model trainer."""
     base_model = XGBClassifier(
-        n_estimators=100,
+        n_estimators=80,
         max_depth=3,
         learning_rate=0.03,
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
-        eval_metric="logloss"
+        eval_metric="logloss",
+        n_jobs=1  # Prevent multi-threading CPU contention across sessions
     )
 
     calibrated_model = CalibratedClassifierCV(
@@ -183,7 +169,7 @@ def predict_asset_direction(
     sentiment_score: float, 
     min_confidence: float = 0.65
 ) -> tuple[str, float, dict]:
-    """Train calibrated XGBoost model and generate actionable market signals."""
+    """Inference engine with safety sanitization."""
     feature_cols = [
         'returns', 'log_ret', 'dist_sma10', 'dist_sma50', 
         'rsi', 'macd_hist', 'volatility', 'volume_change'
@@ -193,6 +179,10 @@ def predict_asset_direction(
     X['sentiment'] = sentiment_score
     y = df['target']
 
+    # Sanitize inputs
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X.fillna(0, inplace=True)
+
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
@@ -201,8 +191,7 @@ def predict_asset_direction(
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Fetch/Train cached model
-    calibrated_model = train_calibrated_model(X_train_scaled, y_train)
+    calibrated_model = get_calibrated_model(X_train_scaled, y_train)
 
     latest_features = X_test_scaled[-1:]
     probs = calibrated_model.predict_proba(latest_features)[0]
@@ -210,7 +199,6 @@ def predict_asset_direction(
     raw_confidence = float(np.max(probs))
     predicted_class = int(np.argmax(probs))
 
-    # Strict Confidence Threshold Filter
     if raw_confidence < min_confidence:
         signal = "HOLD / NEUTRAL"
     else:
@@ -222,7 +210,7 @@ def predict_asset_direction(
         "Sentiment Score": round(sentiment_score, 3)
     }
 
-    # Garbage collection to free server RAM
+    # Free memory explicitly
     del X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled
     gc.collect()
 
@@ -236,7 +224,7 @@ def main():
     st.set_page_config(page_title="Trade Ideas Pro", layout="wide")
     st.title("📈 Trade Ideas Pro (Scalp & Trend Analytics)")
 
-    # Sidebar Controls: Asset & Ticker Selector
+    # Sidebar Controls
     st.sidebar.header("1. Select Market Asset")
     asset_class = st.sidebar.selectbox("Asset Class", options=["Forex", "Crypto", "Stocks", "Indices", "Custom Input"])
 
@@ -264,25 +252,20 @@ def main():
     if st.sidebar.button("Run Model Prediction", type="primary"):
         with st.spinner(f"Analyzing {ticker} across indicators and news..."):
             try:
-                # 1. Fetch & Process Data
                 raw_df = fetch_market_data(ticker, period=period_map[timeframe], interval=timeframe)
                 if raw_df.empty:
                     st.error(f"No market data returned for ticker '{ticker}'.")
                     return
 
                 processed_df = generate_features(raw_df)
-                
-                # 2. Fetch Sentiment
                 sentiment = fetch_sentiment_score(ticker)
                 
-                # 3. Model Inference
                 signal, confidence, metrics = predict_asset_direction(
                     processed_df, 
                     sentiment_score=sentiment, 
                     min_confidence=min_conf
                 )
 
-                # Metric Header Displays
                 col1, col2, col3, col4 = st.columns(4)
                 
                 if signal == "BUY":
@@ -296,7 +279,6 @@ def main():
                 col3.metric("Buy Probability", f"{metrics['Prob(BUY)']}%")
                 col4.metric("Sentiment Score", f"{metrics['Sentiment Score']}")
 
-                # Status Warning Box
                 if signal == "HOLD / NEUTRAL":
                     st.warning(
                         f"⚠️ **Trade Skipped:** The model's win probability is **{confidence * 100:.1f}%**, "
@@ -306,7 +288,6 @@ def main():
                 else:
                     st.success(f"✅ **Trade Setup Identified:** High probability signal with {confidence * 100:.1f}% confidence.")
 
-                # Plot Candlestick Chart
                 st.subheader(f"Price Action ({ticker})")
                 fig = go.Figure(data=[go.Candlestick(
                     x=raw_df.index,
