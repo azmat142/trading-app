@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+yfinance
+xgboost
+plotly
+torch
+transformers
+feedparser
